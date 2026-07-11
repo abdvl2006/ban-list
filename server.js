@@ -1,34 +1,40 @@
 const express = require("express");
-const fs = require("fs");
-const path = require("path");
 const crypto = require("crypto");
+const { Redis } = require("@upstash/redis");
 
 const app = express();
 app.use(express.json());
 
-const DATA_FILE = path.join(__dirname, "bans.json");
 const ADMIN_KEY = process.env.ADMIN_KEY;
-
 if (!ADMIN_KEY) {
   console.error("ADMIN_KEY environment variable is not set. Refusing to start.");
   process.exit(1);
 }
 
-function loadBans() {
-  if (!fs.existsSync(DATA_FILE)) {
-    fs.writeFileSync(DATA_FILE, JSON.stringify({ version: 1, bans: {} }, null, 2));
-  }
-  return JSON.parse(fs.readFileSync(DATA_FILE, "utf8"));
+const redis = new Redis({
+  url: process.env.UPSTASH_REDIS_REST_URL,
+  token: process.env.UPSTASH_REDIS_REST_TOKEN,
+});
+
+const BANS_KEY = "bans"; // hash: userId -> JSON string {reason, bannedAt}
+const VERSION_KEY = "bans_version";
+
+async function getAllBans() {
+  const bans = await redis.hgetall(BANS_KEY);
+  return bans || {};
 }
 
-function saveBans(data) {
-  data.version = (data.version || 0) + 1;
-  fs.writeFileSync(DATA_FILE, JSON.stringify(data, null, 2));
-  return data;
+async function getVersion() {
+  const v = await redis.get(VERSION_KEY);
+  return v ? Number(v) : 1;
 }
 
-function computeEtag(data) {
-  return crypto.createHash("sha1").update(JSON.stringify(data)).digest("hex");
+async function bumpVersion() {
+  return redis.incr(VERSION_KEY);
+}
+
+function computeEtag(payload) {
+  return crypto.createHash("sha1").update(JSON.stringify(payload)).digest("hex");
 }
 
 function requireAdmin(req, res, next) {
@@ -43,43 +49,67 @@ function isValidUserId(userId) {
   return Number.isInteger(userId) && userId > 0;
 }
 
-app.get("/banlist", (req, res) => {
-  const data = loadBans();
-  const payload = { version: data.version, userIds: Object.keys(data.bans).map(Number) };
-  const etag = computeEtag(payload);
+app.get("/banlist", async (req, res) => {
+  try {
+    const [bans, version] = await Promise.all([getAllBans(), getVersion()]);
+    const payload = { version, userIds: Object.keys(bans).map(Number) };
+    const etag = computeEtag(payload);
 
-  if (req.header("if-none-match") === etag) {
-    return res.status(304).end();
+    if (req.header("if-none-match") === etag) {
+      return res.status(304).end();
+    }
+
+    res.set("ETag", etag);
+    res.json(payload);
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal error" });
   }
-
-  res.set("ETag", etag);
-  res.json(payload);
 });
 
-app.post("/admin/ban", requireAdmin, (req, res) => {
-  const { userId, reason } = req.body || {};
-  if (!isValidUserId(userId)) return res.status(400).json({ error: "userId must be a positive integer" });
+app.post("/admin/ban", requireAdmin, async (req, res) => {
+  try {
+    const { userId, reason } = req.body || {};
+    if (!isValidUserId(userId)) return res.status(400).json({ error: "userId must be a positive integer" });
 
-  const data = loadBans();
-  data.bans[userId] = { reason: reason || "Cheating", bannedAt: new Date().toISOString() };
-  saveBans(data);
+    const entry = { reason: reason || "Cheating", bannedAt: new Date().toISOString() };
+    await redis.hset(BANS_KEY, { [userId]: JSON.stringify(entry) });
+    await bumpVersion();
 
-  res.json({ ok: true, userId, reason: data.bans[userId].reason });
+    res.json({ ok: true, userId, reason: entry.reason });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal error" });
+  }
 });
 
-app.post("/admin/unban", requireAdmin, (req, res) => {
-  const { userId } = req.body || {};
-  if (!isValidUserId(userId)) return res.status(400).json({ error: "userId must be a positive integer" });
+app.post("/admin/unban", requireAdmin, async (req, res) => {
+  try {
+    const { userId } = req.body || {};
+    if (!isValidUserId(userId)) return res.status(400).json({ error: "userId must be a positive integer" });
 
-  const data = loadBans();
-  delete data.bans[userId];
-  saveBans(data);
+    await redis.hdel(BANS_KEY, String(userId));
+    await bumpVersion();
 
-  res.json({ ok: true, userId });
+    res.json({ ok: true, userId });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal error" });
+  }
 });
 
-app.get("/admin/list", requireAdmin, (req, res) => {
-  res.json(loadBans());
+app.get("/admin/list", requireAdmin, async (req, res) => {
+  try {
+    const [bans, version] = await Promise.all([getAllBans(), getVersion()]);
+    const parsed = {};
+    for (const [userId, raw] of Object.entries(bans)) {
+      parsed[userId] = JSON.parse(raw);
+    }
+    res.json({ version, bans: parsed });
+  } catch (err) {
+    console.error(err);
+    res.status(500).json({ error: "internal error" });
+  }
 });
 
 const PORT = process.env.PORT || 3000;
